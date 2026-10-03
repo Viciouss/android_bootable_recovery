@@ -16,6 +16,7 @@
 
 #include <drm_fourcc.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -480,18 +481,53 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
     return draw_buf;
 }
 
+static void drm_page_flip_complete(int fd __unused, unsigned int sequence __unused,
+                                   unsigned int tv_sec __unused,
+                                   unsigned int tv_usec __unused, void* user_data) {
+    *static_cast<bool*>(user_data) = false;
+}
+
 static GRSurface* drm_flip(minui_backend* backend __unused) {
     int ret;
+    // static: a late event after a timeout must not write to a dead stack slot
+    static bool ongoing_flip;
+
+    ongoing_flip = true;
+
     memcpy(drm_surfaces[current_buffer]->base.data,
             draw_buf->data, draw_buf->height * draw_buf->row_bytes);
 
-
     ret = drmModePageFlip(drm_fd, main_monitor_crtc->crtc_id,
-                          drm_surfaces[current_buffer]->fb_id, 0, NULL);
+                          drm_surfaces[current_buffer]->fb_id,
+                          DRM_MODE_PAGE_FLIP_EVENT, &ongoing_flip);
     if (ret < 0) {
+        // The frame is dropped, but draw_buf stays valid for the next one
         printf("drmModePageFlip failed ret=%d\n", ret);
-        return NULL;
+        return draw_buf;
     }
+
+    // Wait for the flip to complete, a flip requested while another one is
+    // still pending fails with -EBUSY
+    while (ongoing_flip) {
+        struct pollfd fds = {};
+        fds.fd = drm_fd;
+        fds.events = POLLIN;
+
+        ret = poll(&fds, 1, 1000);
+        if (ret <= 0 || !(fds.revents & POLLIN)) {
+            printf("waiting for page flip failed ret=%d\n", ret);
+            break;
+        }
+
+        drmEventContext evctx = {};
+        evctx.version = DRM_EVENT_CONTEXT_VERSION;
+        evctx.page_flip_handler = drm_page_flip_complete;
+        if (drmHandleEvent(drm_fd, &evctx) != 0) {
+            printf("drmHandleEvent failed\n");
+            break;
+        }
+    }
+
     current_buffer = 1 - current_buffer;
     return draw_buf;
 }
